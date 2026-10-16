@@ -14,6 +14,11 @@
   * 工程實務陷阱與防呆機制
   * 轉發機制與算力解密 (PCIe Forward vs. SoC/PCH vs. Host OS Zero CPU Overhead)
   * PCH 獨立架構與 I2C 匯流排隔離 (Host-Owned SMBus vs. OOB-Owned SMLink / Bus Hang 防呆)
+  * MCTP EID 分配機制與多 BMC 拓撲 (Topmost Bus Owner vs. 網段隔離)
+  * MCTP 實體匯流排與 PCIe VDM TLP 深度解析 (無需 BAR 對映 / PCI-SIG VID 0x1AB4)
+  * MCTP SPDM 與安全機制 (DSP0274 Type 0x05 身分憑證量測與 Type 0x06 加密通訊)
+  * 高密度與 AI 伺服器的 EID 規模爆炸 (Scale & NVMe-MI 獨立 Message Type 0x04)
+  * CXL (Compute Express Link) 架構與 Flit 模式解密 (cxl.cache/mem 原生 Flit 與 cxl.io 打包 TLP)
 
 ---
 

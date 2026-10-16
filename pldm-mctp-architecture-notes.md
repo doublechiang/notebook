@@ -2,6 +2,7 @@
 
 > 本文件彙整 BMC、BIOS、PCH 與 PCIe 擴充卡之間的 MCTP/PLDM 通訊架構、硬體訊號、標準規範與實務設計細節。
 > 建議在 VS Code 中搭配 **Markdown Preview (`Ctrl + Shift + V`)** 或左側 **Outline（大綱目錄）** 快速導航閱讀。
+> 註：為確保 VS Code 大綱樹穩定解析，所有標題列一律使用純文字，不嵌入反引號（inline code）。
 
 ---
 
@@ -14,6 +15,11 @@
 6. [工程實務真相與常見陷阱 (Brutal Truths & Pitfalls)](#6-工程實務真相與常見陷阱-brutal-truths--pitfalls)
 7. [轉發機制與算力解密：PCIe Forward vs. SoC/PCH vs. Host OS](#7-轉發機制與算力解密pcie-forward-vs-socpch-vs-host-os)
 8. [PCH 獨立架構與 I2C 匯流排隔離 (Host-Owned vs. OOB-Owned)](#8-pch-獨立架構與-i2c-匯流排隔離-host-owned-vs-oob-owned)
+9. [MCTP EID 分配機制與多 BMC 拓撲 (DSP0236)](#9-mctp-eid-分配機制與多-bmc-拓撲-dsp0236)
+10. [MCTP 實體匯流排與 PCIe VDM TLP 深度解析](#10-mctp-實體匯流排與-pcie-vdm-tlp-深度解析)
+11. [MCTP SPDM 與安全機制 (DSP0274 / DSP0276)](#11-mctp-spdm-與安全機制-dsp0274--dsp0276)
+12. [高密度與 AI 伺服器的 EID 規模爆炸 (Scale & NVMe-MI)](#12-高密度與-ai-伺服器的-eid-規模爆炸-scale--nvme-mi)
+13. [CXL (Compute Express Link) 架構與 Flit 模式解密](#13-cxl-compute-express-link-架構與-flit-模式解密)
 
 ---
 
@@ -259,3 +265,145 @@ PCH 內部專為帶外管理配置的 I2C/SMBus 控制器通常稱為 **SMLink�
 * **SMBIOS (DSP0246) 的閉環價值**：
   BMC 不需要也不應該直接去探測 Host SMBus 的記憶體 SPD。
   正確架構是由 BIOS 在開機 POST 階段，利用 Host 算力讀完所有 SPD，組成標準 **SMBIOS Table (Type 17)**，再透過 DSP0246 (PLDM over MCTP) 直接轉交給 BMC。
+
+---
+
+## 9. MCTP EID 分配機制與多 BMC 拓撲 (DSP0236)
+
+### 9.1 EID 數值定義與保留區間
+EID（Endpoint ID）是 **8-bit（0～255）** 邏輯位址，在一個連通的 MCTP 網路中必須全域唯一：
+* **`0x00` (Null EID)**：未指派狀態。端點剛通電、尚未獲得 EID 時發送封包必須填入此值。
+* **`0x01` ~ `0x07`**：DMTF 規範保留。
+* **`0x08`**：通常作為 Topmost Bus Owner（主 BMC）的固定 EID。
+* **`0x09` ~ `0xFE`**：一般端點與子號碼池（Pool）動態/靜態分配區間。
+* **`0xFF`**：Broadcast EID（廣播位址）。
+
+### 9.2 三大 EID 指定與分配機制
+1. **動態指派（Set Endpoint ID, 0x01）**：
+   * Bus Owner 向目標硬體位址（PCIe BDF 或 I2C Slave）發送。
+   * 包含 Operation 參數：`00b` (Set EID)、`01b` (Force EID 強制覆蓋)、`10b` (Reset EID 清除重置)、`11b` (Set Discovered Flag 標記探索)。
+2. **靜態端點（Static EID 上報）**：
+   * 某些出廠寫死或硬體 Strap 固定的端點，在收到 `Set Endpoint ID` 時回覆拒絕，並主動通報自身固定 EID，由 Bus Owner 將其登記至路由表。
+3. **號碼池批發（Allocate Endpoint IDs, 0x02）**：
+   * 當端點為 **MCTP Bridge（例如 PCIe Switch 或擴充卡）**，可向 Bus Owner 申請連續 EID Pool（如 Size = 8），由 Bridge 轉發分配給下游子裝置。
+
+### 9.3 路由表綁定 (Routing Table Binding)
+EID 指派完成後，BMC 核心驅動（如 Linux 5.15+ 原生 MCTP 協定堆疊）會將邏輯 EID 與實體介面/位址建立映射：
+```text
+EID 0x08  <=====>  local (BMC 自己)
+EID 0x14  <=====>  dev mctppcie0,  Target BDF: 01:00.0 (PCIe VDM)
+EID 0x15  <=====>  dev mctpi2c3,   Target I2C Addr: 0x32 (SMBus)
+```
+
+### 9.4 多 BMC 串接架構：Topmost Bus Owner vs. 網段隔離
+在同一個平坦的 MCTP 空間中，**絕對只能有一個 Master（Topmost Bus Owner）**，避免位址衝突：
+* **架構一：Topmost Bus Owner + Bridge 模式（單一 EID 全域空間）**
+  * 主 BMC 作為 Topmost Bus Owner 掌管 `0x09 ~ 0xFE` 號碼池。
+  * 副 BMC 作為 MCTP Bridge，向主 BMC 批發一組 EID Pool（如 `0x20 ~ 0x2F`），分給擴充匣零件。
+  * 優點：全機台平坦互通，主 BMC 可直達所有 EID。
+* **架構二：網段隔離模式（Isolated MCTP Domains - 實務常見）**
+  * 每個節點的 BMC 各自作為該節點的 Topmost Bus Owner。
+  * 兩邊內部 EID 獨立（哪怕重複使用 `0x10` 也互不干擾）。
+  * 跨節點/跨 BMC 通訊改走上層 **Redfish RESTful API、內部 Ethernet 或 Mailbox**。
+  * 優點：避免 256 個 EID 上限耗盡，並達到物理故障隔離（Fault Isolation）。
+
+---
+
+## 10. MCTP 實體匯流排與 PCIe VDM TLP 深度解析
+
+### 10.1 MCTP 支援的實體匯流排全貌
+MCTP 為實體層無關協定，由不同的 DMTF Transport Binding 規範定義：
+* **DSP0238**：**PCIe VDM**（現代高頻遙測與韌體更新主力）。
+* **DSP0237**：**SMBus / I2C**（傳統側頻線與待機狀態監控）。
+* **DSP0241**：**I3C**（次世代高速感測器與帶內中斷管理）。
+* **DSP0239**：**KCS (LPC/eSPI)**（Host CPU/BIOS 與 BMC 通訊）。
+* **DSP0283**：**USB**（機箱外接維護與內部虛擬通道）。
+* **DSP0234**：**Serial (UART)**（除錯與極簡微控制器）。
+
+### 10.2 為什麼在 PCIe 上「只能使用 VDM TLP」？
+根據 **DSP0238**，MCTP 嚴格採用 **PCIe Type 1 Vendor Defined Message with Data（MsgD, Type 1）**：
+1. **無需記憶體對映（No BAR / No Memory Mapping）**：
+   * 一般 Memory Read/Write TLP 需要 Host BIOS/OS 分配實體記憶體空間（BAR）。
+   * VDM 是 Message TLP，純封包交換，不佔用 Host 記憶體位址空間，維持帶外（Out-of-band）獨立性。
+2. **內建豐富的路由標頭（Routing Capabilities）**：
+   * 原生支援 `Route to Root Complex (000b)`、`Route by ID (010b)` 與 `Broadcast (011b)`。
+3. **PCI-SIG 合規與防撞車**：
+   * DMTF 註冊了專屬 Vendor ID：**`0x1AB4`**。硬體濾波器藉此快速辨識，不與其他廠商私有 Message 衝突。
+
+---
+
+## 11. MCTP SPDM 與安全機制 (DSP0274 / DSP0276)
+
+### 11.1 MCTP Message Type 分類
+MCTP 表頭使用 1 個 Byte 的 Message Type 標示負載類型：
+* **`0x00`**：MCTP Control（Discovery, Set EID）。
+* **`0x01`**：PLDM（DSP0240~0267，感測器、FRU、SMBIOS、韌體更新）。
+* **`0x02`**：NC-SI（網卡側頻管理）。
+* **`0x04`**：NVMe-MI（NVMe 儲存管理）。
+* **`0x05`**：**SPDM（DSP0274，安全協定與資料模型）** ◀── 核心安全握手通道。
+* **`0x06`**：**Secured MCTP（DSP0276，加密保護封包）**。
+
+### 11.2 SPDM (DSP0274) 解決的三大安全痛點
+防止偽造硬體、惡意替換卡片或韌體篡改（Supply Chain Attacks）：
+1. **身分認證（Authentication）**：
+   * 卡片回傳原廠私鑰簽署的 X.509 憑證鏈，BMC 透過內建原廠 Root CA 檢驗真實身分。
+2. **防偽質詢（Challenge）**：
+   * BMC 送出隨機亂數（Nonce），卡片以晶片硬體安全私鑰完成數位簽章並回傳，證明為合法實體。
+3. **韌體度量（Attestation / Measurement）**：
+   * BMC 索取卡片開機韌體 Hash 值（Measurement Record），驗證韌體未遭未授權竄改。
+
+### 11.3 Type 0x05 (SPDM) 與 Type 0x06 (Secured MCTP) 的協同流程
+```text
+[ 階段一：安全交握 (Message Type 0x05 - SPDM) ]
+  BMC 與 卡片 透過 Type 0x05 進行憑證驗證、質詢與安全量測
+       │
+       ▼ KEY_EXCHANGE
+  雙方協商出對稱加密臨時會話金鑰 (Session Key: AES-GCM / ChaCha20)
+       │
+       ▼
+[ 階段二：全程加密傳輸 (Message Type 0x06 - Secured MCTP) ]
+  後續敏感資料傳輸與 PLDM 韌體更新，全部以 Type 0x06 加密並附帶 MAC 防篡改驗證
+```
+
+---
+
+## 12. 高密度與 AI 伺服器的 EID 規模爆炸 (Scale & NVMe-MI)
+
+### 12.1 傳統伺服器 vs. 現代 AI 伺服器的 EID 差距
+* **傳統通用型伺服器**：全機只有約 10~20 個 EID（BMC 自身、BIOS、2~3 張 PCIe 卡、電源、硬碟背板 MCU）。8-bit EID（256 個空間）綽綽有餘。
+* **現代 AI 伺服器 (如 8-GPU 系統)**：EID 出現指數級增長，單機可達到 80~120 個以上：
+  1. **高階加速卡/SmartNIC 內建多 Endpoint**：單張卡包含主 DPU + 安全 RoT 晶片 + 內部 PCIe Switch + 光模組控制器，單卡就佔用 4~8 個 EID。
+  2. **NVMe-MI 儲存端點**：24 顆 NVMe SSD 直接吃掉 24 個 EID。
+  3. **800G 光模組 (CMIS over MCTP)**：每個光模組控制器獨立消耗 EID。
+  4. **Rack-Scale (整機櫃架構)**：多節點串接時瞬間突破 256 個上限，這正是推動實務走向「Isolated MCTP Domains」的物理根因。
+
+### 12.2 NVMe-MI 的協定本質
+* **獨立的 Message Type (0x04)**：NVMe-MI 不是 PLDM 的子集，而是由 NVM Express 組織制定的獨立標準，與 PLDM 平起平坐。
+* **Smart Device 證明**：每顆支援 NVMe-MI over MCTP 的 SSD 都自帶完整的微控制器與協定堆疊，必須分配獨立 EID。BMC 透過 `0x04` 指令直讀 Flash 磨損率、SMART 健康度與壞軌率，映射至 Redfish。
+
+---
+
+## 13. CXL (Compute Express Link) 架構與 Flit 模式解密
+
+### 13.1 CXL 解決的核心痛點
+* **記憶體牆 (Memory Wall)**：打破 CPU 封裝與主機板 PCB 走線限制，允許記憶體做成標準 PCIe 擴充卡。
+* **快取一致性 (Cache Coherency)**：免去傳統 PCIe DMA 資料搬移與軟體快取同步的巨大開銷。
+* **三合一協定**：
+  * **`cxl.io`**：傳統 PCIe 協定（枚舉、配置空間、中斷、MCTP VDM）。
+  * **`cxl.cache`**：裝置直接存取 CPU 快取（以極短硬體延遲向 CPU Home Agent 發起快取行協商）。
+  * **`cxl.mem`**：CPU 以標準 `Load/Store` 存取外部裝置記憶體（延遲僅約 150~200 ns，逼近主記憶體）。
+
+### 13.2 實體型態與協商機制
+* **插槽與外觀完全未變**：依然插在標準 **PCIe CEM Slot (x8/x16)** 或 **EDSFF (E1.S/E3.S)** 插槽，走既有的高速差分線。
+* **Alternate Protocol 協商**：開機 LTSSM 階段，CPU 與裝置透過標準機制對上暗號，實體層立刻由純 PCIe 模式切換為 CXL 模式。
+
+### 13.3 實體傳輸層巨變：告別裸奔 TLP，全面改跑 Flit (Flow Control Unit)
+CXL 協商成功後，實體鏈路不再跑傳統變長、裸奔的 TLP，而是切換為**固定大小的 Flit（如 68-Byte 或 256-Byte）**：
+1. **`cxl.cache` 與 `cxl.mem`**：
+   * 原生 Flit 結構，完全不使用 TLP。
+   * 操作精確對齊 **64-Byte Cache Line**，無任何 TLP Header 解包延遲。
+   * 定址使用標準 **Host Physical Address (HPA)**，由 CPU Home Agent 負責硬體 Snoop 窺探。
+2. **`cxl.io`（保留 TLP 靈魂）**：
+   * 傳統的 PCIe TLP（包含 BIOS 枚舉、設定暫存器、以及 **MCTP PCIe VDM 封包**）被硬體**切碎、打包塞進 Flit 的 Payload 貨櫃**裡運送，到達後再還原。
+3. **推動標準演進**：
+   * CXL 的 Flit 設計奠定了次世代匯流排標準，**PCIe 6.0 規範已正式全面廢除傳統裸奔 TLP，強制採用 256-Byte Flit 模式**。
