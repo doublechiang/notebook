@@ -1,6 +1,6 @@
 # PLDM & MCTP 伺服器硬體管理架構筆記 (Server Hardware Management Notes)
 
-> 本文件彙整 BMC、BIOS 與 PCIe 擴充卡之間的 MCTP/PLDM 通訊架構、硬體訊號、標準規範與實務設計細節。
+> 本文件彙整 BMC、BIOS、PCH 與 PCIe 擴充卡之間的 MCTP/PLDM 通訊架構、硬體訊號、標準規範與實務設計細節。
 > 建議在 VS Code 中搭配 **Markdown Preview (`Ctrl + Shift + V`)** 或左側 **Outline（大綱目錄）** 快速導航閱讀。
 
 ---
@@ -12,6 +12,8 @@
 4. [卡片開機與 BMC 偵測機制 (Power & Presence)](#4-卡片開機與-bmc-偵測機制-power--presence)
 5. [深度剖析：PCIe VDM、Discovery Notify 與 Bus Owner](#5-深度剖析pcie-vdmdiscovery-notify-與-bus-owner)
 6. [工程實務真相與常見陷阱 (Brutal Truths & Pitfalls)](#6-工程實務真相與常見陷阱-brutal-truths--pitfalls)
+7. [轉發機制與算力解密：PCIe Forward vs. SoC/PCH vs. Host OS](#7-轉發機制與算力解密pcie-forward-vs-socpch-vs-host-os)
+8. [PCH 獨立架構與 I2C 匯流排隔離 (Host-Owned vs. OOB-Owned)](#8-pch-獨立架構與-i2c-匯流排隔離-host-owned-vs-oob-owned)
 
 ---
 
@@ -129,7 +131,7 @@ BMC 如何知道卡片通電並就緒？拆解為實體層與通訊層：
 1. **是的，Discovery Notify 在規範中確實走 PCIe VDM**。
 2. **是的，BMC 是「MCTP 邏輯上的 Bus Owner」，但它「不是 PCIe 實體上的 Root Complex」**。
 
-### 5.2 `Route to Root Complex` (000b) 定址機制
+### 5.2 Route to Root Complex (000b) 定址機制
 根據 **DSP0238**：
 * 卡片開機後，不知道 BMC 的 BDF，因此發送 PCIe VDM 時，Header 中的 Routing 欄位設為 **`000b` (Route to Root Complex)**。
 * 卡片將封包往 Upstream（朝樹頂的 CPU）拋送。
@@ -182,3 +184,78 @@ BMC 如何知道卡片通電並就緒？拆解為實體層與通訊層：
    * 重要管理訊號（如緊急電源監控）若走 PCIe VDM，在 Crash Dump 時可能無法提取，需審慎評估是否輔以 SMBus Sideband。
 3. **PDR 解析開銷**：
    * 某些高階加速卡（如多 GPU 系統）的 PDR 數量可達上千筆，BMC 在拉取時若單次封包傳輸逾時，可能導致整台伺服器 Redfish 初始化停滯。需要實作快取（Cache）與非同步更新機制。
+
+---
+
+## 7. 轉發機制與算力解密：PCIe Forward vs. SoC/PCH vs. Host OS
+
+在理解訊息轉發（Forwarding）時，工程師最常探討：**轉發過程是否會消耗 Host CPU 的算力（CPU Cycles / Compute Power）？**
+
+### 7.1 PCIe Forwarding：純硬體線速交換（零算力消耗）
+* PCIe VDM 封包在 PCIe Switch 或 Root Complex 晶片內部的轉發，完全屬於 **PCIe Transaction Layer（交易層）** 的硬體行為。
+* 晶片內部只根據 TLP Header 的 Routing 欄位進行硬體重定向（改寫為 `Route by ID` 並指向 BMC BDF）。
+* **特性**：
+  * **Zero CPU Cycles**：不消耗 Host CPU 任何運算時脈。
+  * **No Interrupt**：不觸發 Host CPU 的 MSI/MSI-X 中斷。
+  * **Host OS 完全無感知**。
+
+### 7.2 SoC / PCH 硬體 FIFO 與 eSPI 橋接（不需 Host CPU Decode）
+在現代伺服器 SoC（如 AMD EPYC 或 Intel Xeon + PCH）中，晶片內部明確區分：
+1. **Host 運算核心（Compute Cores）**：跑 OS、BIOS、業務應用程式的 x86/ARM 核心。
+2. **I/O Die / Uncore 硬體電路**：包含 PCIe 控制器、內部 Crossbar / NoC（Network-on-Chip）。
+3. **輔助管理核心（Embedded Co-processor）**：如 AMD **PSP（Platform Security Processor / MP0）** 或 Intel **ME/SPS（Management Engine）**。
+
+* **運作機制**：
+  * PCIe 控制器內建硬體濾波器（比對 DMTF Vendor ID `0x1AB4`）。
+  * 命中後直接透過硬體 DMA 串流送入專屬 FIFO，或直接轉換推給 eSPI 控制器往外送至 BMC。
+  * 若需微碼協助，也是由晶片內建的獨立輔助小核心處理，**Host CPU 核心完全不參與 Decode**。
+
+### 7.3 何時才真的會吃 Host CPU 算力？（In-Band 軟體代理）
+只有在沒有硬體轉發電路、必須在 Host 作業系統內掛載驅動（如 Linux Kernel 的 `mctp-pci` 驅動）時，才會消耗 CPU 算力：
+* 封包到達 ➔ 觸發 Host CPU **MSI-X 中斷** ➔ CPU 暫停業務執行中斷處理常式 ➔ **OS 核心驅動 Decode 封包** ➔ 轉拋給 BMC。
+* **致命缺點**：消耗 CPU 算力、產生延遲抖動（Jitter）、且若 Host OS 當機（Kernel Panic），整套硬體監控立即中斷。
+
+### 7.4 三種轉發方式架構比較表
+
+| 比較維度 | 1. 純 PCIe Forward (硬體交換) | 2. SoC 硬體 FIFO / eSPI 橋接 | 3. Host OS 軟體轉發 (In-Band) |
+| :--- | :--- | :--- | :--- |
+| **處理單元** | PCIe Switch / RC 交易層硬體邏輯 | I/O Die 專屬硬體濾波器 / eSPI 電路 | **Host x86/ARM CPU Cores** |
+| **Host CPU 算力消耗** | **0%（Zero Cycles）** | **0%（Zero Cycles）** | **被中斷打斷，需消耗 CPU 算力** |
+| **Decode 發生點**| **BMC 端** 才做 Decode | **BMC 端** 才做 Decode | **Host OS 驅動** 必須先 Decode |
+| **Host 當機時** | 依然正常運作 | 只要 SoC 供電正常就可運作 | **直接癱瘓** |
+| **硬體代價** | 需硬體支援 PCIe 路由至 BMC | SoC 需內建硬體 VDM 濾波器邏輯 | 零硬體成本（純靠軟體苦工） |
+
+---
+
+## 8. PCH 獨立架構與 I2C 匯流排隔離 (Host-Owned vs. OOB-Owned)
+
+### 8.1 PCH 電源域與獨立運作能力
+* **主運算電（Main Power: VCORE / VCCIN）**：伺服器關機（ACPI S5/G3 狀態）時完全斷電。
+* **待機電（Standby Power: 3.3V_AUX / Primary Well）**：只要交流電源線插上即通電。
+* **PCH 內部獨立分區**：PCH 內部吃 `3.3V_AUX` 的獨立電源域（Primary Well）中，跑著獨立的微控制器（Intel ME / SPS）。
+* **結論**：在主機完全關機、CPU 核心連半點電都沒有時，PCH 內部的管理引擎與專屬 I2C Master 早就已經通電全速運作。
+
+### 8.2 PCH 內的 I2C Master：SMLink 職責
+PCH 內部專為帶外管理配置的 I2C/SMBus 控制器通常稱為 **SMLink（System Management Link）**：
+* **SMLink0**：直連 BMC，作為 PCH/ME 與 BMC 之間的側頻管理幹道。
+* **SMLink1 / SMLink2**：連接主機板 VRM 供電晶片（PMBus）、記憶體溫度感測、以及 PCIe 插槽側頻線路。
+* **自主轉發（Forwarding）**：PCH 的 ME 自主擔任 Master，向 VRM / 電源定期收集功耗與溫度（Node Manager 功能），再打包轉發給 BMC。**全程由 PCH 自帶的微小核心運算，Host CPU 負載為 0%**。
+
+### 8.3 Host Linux 下的 i2cdetect 究竟接到什麼？
+在 Host Linux 敲 `i2cdetect` 看到的是 **Host-Owned SMBus**（透過 `i2c-i801` 驅動，吃 Host CPU 算力），其連接對象受到嚴格硬體侷限：
+
+| I2C 位址範圍 (Address) | 對應的真實硬體零件 | 用途說明 |
+| :--- | :--- | :--- |
+| **`0x50` ~ `0x57`** | **DDR 記憶體 SPD EEPROM** | 各 DIMM 插槽記憶體規格（容量、時序、序號）。OS 用 `decode-dimms` 讀取。 |
+| **`0x18` ~ `0x1F`** | **DDR TSOD（記憶體板載測溫晶片）** | 記憶體條上的 Thermal Sensor on DIMM。 |
+| **`0x70` ~ `0x77`** | **I2C Mux 切換晶片（如 PCA9548）** | 記憶體插槽眾多時，用來分 Channel 切換位址。 |
+| **`0x69`** | **PCIe Clock Generator（時脈產生器）** | 產生 PCIe 100MHz 參考時脈（Refclk）的振盪晶片。 |
+| **`0x20` 左右** | **PCIe Retimer / Redriver 晶片** | 少數設計將 PCIe Gen4/Gen5 訊號放大晶片掛於此處供主機端調測眼圖。 |
+
+### 8.4 物理隔離（Physical Segregation）的工程鐵律
+* **嚴禁共用同一條 I2C Bus**：
+  伺服器硬體設計極力避免讓 Host OS 與 PCH/ME/BMC 共享同一條 I2C 匯流排。
+  I2C 的 Multi-Master 碰撞處理能力極差，一旦兩邊同時發起傳輸，極易引發 **SDA Held Low（Bus Hang 鎖死）**，導致管理遙測中斷甚至誤觸發硬體保護斷電。
+* **SMBIOS (DSP0246) 的閉環價值**：
+  BMC 不需要也不應該直接去探測 Host SMBus 的記憶體 SPD。
+  正確架構是由 BIOS 在開機 POST 階段，利用 Host 算力讀完所有 SPD，組成標準 **SMBIOS Table (Type 17)**，再透過 DSP0246 (PLDM over MCTP) 直接轉交給 BMC。

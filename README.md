@@ -12,6 +12,8 @@
   * 卡片開機、在位偵測 (PRSNT#)、電源時序 (3.3V_AUX vs. Main Power)
   * PCIe VDM、`Discovery Notify` (`000b` Route to Root Complex) 與 BMC Bus Owner 轉發拓撲
   * 工程實務陷阱與防呆機制
+  * 轉發機制與算力解密 (PCIe Forward vs. SoC/PCH vs. Host OS Zero CPU Overhead)
+  * PCH 獨立架構與 I2C 匯流排隔離 (Host-Owned SMBus vs. OOB-Owned SMLink / Bus Hang 防呆)
 
 ---
 
