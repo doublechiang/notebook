@@ -19,6 +19,8 @@
   * MCTP SPDM 與安全機制 (DSP0274 Type 0x05 身分憑證量測與 Type 0x06 加密通訊)
   * 高密度與 AI 伺服器的 EID 規模爆炸 (Scale & NVMe-MI 獨立 Message Type 0x04)
   * CXL (Compute Express Link) 架構與 Flit 模式解密 (cxl.cache/mem 原生 Flit 與 cxl.io 打包 TLP)
+  * EID 空間耗盡的四大產業界實務解法 (Isolated Domains, Dynamic Reset, Bridge, 16-bit EID)
+  * 附錄：PCIe Enumeration 枚舉階段資源分配深度剖析 (BDF、BAR 探測原理與 VDM 路由依賴)
 
 ---
 

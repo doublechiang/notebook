@@ -20,6 +20,8 @@
 11. [MCTP SPDM 與安全機制 (DSP0274 / DSP0276)](#11-mctp-spdm-與安全機制-dsp0274--dsp0276)
 12. [高密度與 AI 伺服器的 EID 規模爆炸 (Scale & NVMe-MI)](#12-高密度與-ai-伺服器的-eid-規模爆炸-scale--nvme-mi)
 13. [CXL (Compute Express Link) 架構與 Flit 模式解密](#13-cxl-compute-express-link-架構與-flit-模式解密)
+14. [EID 空間耗盡的四大產業界實務解法](#14-eid-空間耗盡的四大產業界實務解法)
+15. [附錄：PCIe Enumeration 枚舉階段資源分配深度剖析](#15-附錄pcie-enumeration-枚舉階段資源分配深度剖析)
 
 ---
 
@@ -407,3 +409,46 @@ CXL 協商成功後，實體鏈路不再跑傳統變長、裸奔的 TLP，而是
    * 傳統的 PCIe TLP（包含 BIOS 枚舉、設定暫存器、以及 **MCTP PCIe VDM 封包**）被硬體**切碎、打包塞進 Flit 的 Payload 貨櫃**裡運送，到達後再還原。
 3. **推動標準演進**：
    * CXL 的 Flit 設計奠定了次世代匯流排標準，**PCIe 6.0 規範已正式全面廢除傳統裸奔 TLP，強制採用 256-Byte Flit 模式**。
+
+---
+
+## 14. EID 空間耗盡的四大產業界實務解法
+
+面對 8-bit EID 上限（256 個位址），工業界在 AI 與超大規模系統中採取以下手段：
+
+1. **網段隔離模式（Isolated MCTP Domains - 最主流標準）**：
+   * 模組化設計（主板 BMC、GPU Tray BMC、Storage JBOF BMC 各自獨立）。
+   * 每個 BMC 在本地都是 Topmost Bus Owner，內部重複使用 EID 空間毫無衝突。
+   * 跨模組與上層通訊一律提升至 **Redfish RESTful API over Internal Ethernet**，不依賴底層 MCTP 路由。
+2. **動態回收與按需分配（Dynamic Allocation & Deallocation）**：
+   * 對非即時監控裝置（如只在開機做 FRU 盤點的模組），盤點完成後由 BMC 送出 `Set Endpoint ID (Op=10b: Reset EID)` 釋放號碼。
+3. **MCTP Bridge 聚合與代理（Switch Aggregation）**：
+   * 由 PCIe Switch 代理下游 16 顆 NVMe SSD，Switch 對上游只佔用 1 個 EID，內部代為收集與轉發。
+4. **規範升級（Extended 16-bit EID）**：
+   * DMTF 正在研擬 16-bit 擴展 EID（提供 65,536 個位址），為未來 Rack-Scale 架構提供根本性位址空間擴展。
+
+---
+
+## 15. 附錄：PCIe Enumeration 枚舉階段資源分配深度剖析
+
+### 15.1 為什麼大多工程師對 PCIe Enumeration 一知半解？
+在許多團隊中，工程師只看 OS 端的 `lspci -tv` 樹狀圖，卻忽略了開機 POST 階段 BIOS/UEFI 所進行的**深度優先搜尋（DFS, Depth-First Search）**與核心硬體資源分配。
+
+### 15.2 枚舉核心任務：分配四大實體硬體資源
+開機時，Host BIOS 的 PCI Host Bridge 必須依序完成：
+1. **BDF 定址指派 (Bus / Device / Function)**：
+   * 由根節點 Bus 0 開始遍歷。
+   * 遇到 PCIe-to-PCIe Bridge（或 Switch）：寫入 `Primary Bus`、`Secondary Bus` 與 `Subordinate Bus` 暫存器，定義下游節點的最大 Bus 號碼範圍。
+2. **BAR 大小探測與記憶體對映 (Base Address Register Allocation)**：
+   * **探測原理**：BIOS 向裝置的 BAR 暫存器寫入全 1 (`0xFFFF_FFFF`)，再讀回。若硬體回傳高位 bit 鎖定、低位全 0，低位 0 的數量即可算出該裝置需要的記憶體空間大小（如 $2^{20} = 1\text{MB}$）。
+   * **資源分配**：BIOS 根據探測結果，在 CPU 的實體記憶體空間（MMIO: 32-bit 或 64-bit Prefetchable/Non-prefetchable）劃出一塊無衝突的連續區間寫回 BAR。
+3. **IO Space 分配**：
+   * 傳統 x86 64KB I/O 埠空間配置（現代裝置多已廢棄，主要走 MMIO）。
+4. **中斷路由 (Interrupt Line & MSI/MSI-X Table)**：
+   * 讀取裝置的 `Interrupt Pin`，配置中斷路由，並於 MMIO 空間中建立 MSI-X Table 向量表。
+
+### 15.3 枚舉與 MCTP PCIe VDM 的生死連動
+* **為什麼 PCIe VDM 必須等待枚舉完成？**
+  * PCIe VDM 的點對點路由依賴 **`Route by ID (010b)`**，這需要封包 Header 填入接收端的 **Requester ID / Completer ID (BDF)**。
+  * 在 BIOS 完成深度優先遍歷並寫入所有 Bridge 的 Secondary/Subordinate Bus 暫存器之前，PCIe Switch 的硬體路由邏輯根本無法判斷某個 BDF 到底位於哪個 Downstream Port。
+  * **結論**：這正是為何 BMC 的 PCIe VDM 探索通道，必須嚴格等待 Host BIOS POST 回報「PCIe Enumeration 完成」後方能啟動的底層根本原因！
