@@ -35,6 +35,17 @@
   * 製造測試 (MFG/Diag) 檢測清單：PPI 實體在場、EK 憑證檢驗、Self-Test 故障鎖定
   * 工程陷阱與除錯心法：PCR 飄移 (PCR Drift)、SPI Bus Hang 與 Lockout 計數器
 
+### 核心架構與系統工程 (Kernel Architecture & System Engineering)
+* [**Linux 核心電源管理與高效能 I/O 多路復用架構筆記**](linux-system-architecture-notes.md)
+  * CPU 電源管理核心概念：C-state (Idle 睡眠) 與 P-state (Active DVFS) 層級架構
+  * x86 `HLT` 指令本質與 C-state 關閉狀態下的硬體行為 (C1 Clock Gating vs. `idle=poll` C0 鎖定)
+  * 為什麼需要 P-state：Race-to-Sleep (Race-to-Idle) 假說與四大物理限制 ($P \propto C \cdot V^2 \cdot f$ 電壓平方懲罰、Memory/IO 延遲等公車效應、TjMax 散熱牆與機房功率封頂)
+  * 伺服器製造測試 (MFG/Diag) 調優：停用 C-state (消除 Jitter 與 di/dt 突波) 與鎖定 P-state (基準可重現性)
+  * I/O 多路復用演進與瓶頸：`select` (Bitmap 1024 限制、全量拷貝、雙重 O(N) 遍歷) 與 `poll` (`struct pollfd` 動態陣列)
+  * 現代高效能基石：`epoll` 核心雙結構 (紅黑樹 O(log N) 管理 vs. 就緒雙向鏈結串列 O(1)~O(K) 提取) 與 LT/ET 觸發模式
+  * 信號競爭 (Race Condition) 陷阱：`select` 盲區與 `pselect` 原子性信號遮罩 (Atomic Sigmask) 原理
+  * 核心機制對比總結表 (C-state vs. P-state、select vs. poll vs. epoll)
+
 ---
 
 ## 閱讀建議 (Viewing in VS Code)
