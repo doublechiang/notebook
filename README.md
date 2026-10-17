@@ -26,10 +26,10 @@
 * [**TPM 2.0 架構與可信賴計算技術筆記**](tpm-architecture-notes.md)
   * TCG TPM 2.0 規範與密碼學敏捷性 (Crypto Agile vs. TPM 1.2)
   * 實體型態 (dTPM, fTPM, vTPM) 與匯流排介面 (TIS 1.3 FIFO vs. PTP CRB Shared Memory)
-  * 晶片儲存真相與極限：Key Wrapping 模型 (無限子金鑰)、NVRAM 容量 (7~16 KB)、憑證 (X.509) 與金鑰 Slot 限制
+  * 晶片儲存真相與極限：Key Wrapping 模型 (無限子金鑰)、NVRAM 容量 (7~16 KB)、兩大 NV 存儲型態 (Raw NV Index 0x01 vs. Persistent Key 0x81)、憑證與金鑰 Slot 限制
   * 四大獨立階層架構 (Platform, Storage, Endorsement, Null) 與 Primary Seeds 衍生模型
   * 平台配置暫存器 (PCR) 數學 Extend 原理、單一指令約束 (非 Range)、開機時序交錯真相與 0~23 分配表
-  * 信任鏈 (Chain of Trust) 傳遞時序、惡意 EFI 檔案攔截原理 (Measure BEFORE Execute) 與 TCG Event Log 回放驗證
+  * 信任鏈 (Chain of Trust) 傳遞時序：CRTM 燒錄器攻擊與矽晶片信任根 (Silicon RoT)、eFuse 驗證 IBB 邊界 (NEM 快取限制)、雙軌接力 (Verified vs. Measured Boot)、NVRAM 盲區防禦與 TCG Event Log 回放驗證
   * 放行機制判定：本地封印 (Local Sealing) vs 遠端證明 (Remote Attestation) 與 BIOS/OS 升級雙面刃解法
   * Linux 核心節點 (`/dev/tpm0` vs. `/dev/tpmrm0`) 與 TSS 2.0 軟體堆疊 (FAPI/ESAPI/SAPI/TCTI)
   * 製造測試 (MFG/Diag) 檢測清單：PPI 實體在場、EK 憑證檢驗、Self-Test 故障鎖定

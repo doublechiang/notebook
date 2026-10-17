@@ -180,6 +180,47 @@ Host 處理器（CPU/PCH）與 TPM 晶片通訊時，遵循 TCG 定義的介面�
 3. **執行期暫存金鑰槽位（Transient Keys, `0x80xxxxxx`）**：
    * 晶片內部 SRAM 極度狹小，同時只能載入 **3 ～ 7 把金鑰**。多行程競爭時依賴 Linux 核心 `/dev/tpmrm0` 進行自動 Context Swap-out。
 
+### 4.4 NV 存儲兩大型態深度剖析：Raw NV Index (0x01xxxxxx) vs. Persistent Key Object (0x81xxxxxx)
+
+在工程實務中，工程師常說「把 Key 存在 NVRAM」，但底層實際上存在兩種本質完全不同的運作模型：
+
+```
+【型態一：Raw NV Index (0x01500001) - 硬體保險箱小抽屜】
+  [ TPM 晶片 NVRAM ]                              [ 主機 CPU / RAM ]
+┌───────────────────────────┐                  ┌──────────────────────────────┐
+│ [NV Index 0x01500001]     │ ── tpm2_nvread ─▶│ 取得 32-byte 原始 AES 明文   │
+│ 純二進位 Raw Bytes (金鑰) │ (私鑰被讀出晶片) │ 由主機 CPU 記憶體負責解密    │
+└───────────────────────────┘                  └──────────────────────────────┘
+
+【型態二：Persistent Key Object (0x81000001) - 固化密碼運算器】
+  [ TPM 晶片 (私鑰 100% 隔離，永不出晶片) ]       [ 主機 CPU / RAM ]
+┌───────────────────────────┐                  ┌──────────────────────────────┐
+│ [Handle 0x81000001]       │ ◀── 送入數據 ─── │ 將待簽名/待解密資料傳給晶片  │
+│ 內部硬體 RSA/ECC 密碼核心 │ ─── 吐出結果 ──▶ │ 僅拿回最終數位簽章或運算結果 │
+└───────────────────────────┘                  └──────────────────────────────┘
+```
+
+#### 兩大模型本質對比表
+
+| 維度 | 型態一：Raw NV Index (`0x01xxxxxx`) | 型態二：Persistent Key Object (`0x81xxxxxx`) |
+| :--- | :--- | :--- |
+| **儲存本質** | **純二進位資料（Raw Data Bytes）** | **完整密碼學金鑰物件結構**（私鑰、公鑰、演算法範本、授權屬性） |
+| **金鑰類型** | 通常存放對稱金鑰（AES-128/256）、密碼字串或 X.509 憑證 | 非對稱金鑰（RSA-2048/4096、ECC NIST P-256） |
+| **使用方式** | 透過 `TPM2_NV_Read` **將明文讀出晶片外**給 CPU 使用 | **直接傳遞 Handle**，命令 TPM 在晶片內部執行簽章/解密 |
+| **私鑰安全性** | 私鑰會進到主機 RAM，有遭受 DMA 探針或冷啟動側錄風險 | **私鑰永遠不出晶片（硬體隔離等級最高）** |
+| **空間消耗** | 依定義的位元組數而定（如 32 bytes 僅佔 32B + 元數據） | 一把持久化 RSA-2048 金鑰需消耗約 **600B ~ 1 KB** 的 NV 空間 |
+| **典型應用** | 存放出廠 EK 憑證 (`0x01c00002`)、系統資產編號、BitLocker VMK 裸存 | 系統儲存根金鑰（SRK `0x81000001`）、平台背書金鑰、mTLS 伺服器端身分金鑰 |
+
+#### 典型指令操作流程對比：
+* **型態一（Raw NV Index）**：
+  1. `tpm2_nvdefinespace -C o -s 32 -a "policyread|ownerwrite" 0x01500001`（建立空間並設定授權策略）
+  2. `tpm2_nvwrite -C o -i aes_key.bin 0x01500001`（將明文寫入）
+  3. `tpm2_nvread -C o 0x01500001 -o /dev/shm/key.bin`（**讀出到主機 RAM 使用**）
+* **型態二（Persistent Key Object）**：
+  1. `tpm2_createprimary -C o -g sha256 -G rsa -c primary.ctx`（在揮發性記憶體動態建立金鑰，暫存 Handle `0x80xxxxxx`）
+  2. `tpm2_evictcontrol -C o -c primary.ctx 0x81000001`（**釘選進 NVRAM，固化為永久 Handle**）
+  3. `tpm2_sign -c 0x81000001 -g sha256 -o sig.bin data.txt`（**直接呼叫 Handle 運算，私鑰不出晶片**）
+
 ---
 
 ## 5. TPM 2.0 階層架構與金鑰管理體系 (Hierarchies & Keys)
@@ -292,45 +333,115 @@ TPM_RC TPM2_PCR_Extend(
 
 ## 7. 信任鏈與度量引導 (Measured Boot & TCG Event Log)
 
-### 7.1 信任鏈傳遞時序與「先度量、後執行」原則
+### 7.1 CRTM 實體不可篡改真相：外掛 SPI 燒錄器攻擊 vs. 矽晶片信任根 (Silicon RoT)
+
+在 TCG 早期規範中，常將 CRTM（Core Root of Trust for Measurement）描述為「物理不可竄改的開機代碼」。然而從硬體工程角度來看，若 CRTM 僅存放於主機板上的外掛 SPI NOR Flash（如 Winbond / Macronix），**使用 DediProg 燒錄夾（Clip Attack）或實體探針直接夾住晶片引腳，即可隨意改寫 Boot Block**。
+
+為了杜絕硬體燒錄器改寫攻擊，現代伺服器架構將「真正的信任根」從外部 SPI Flash 收回到**「CPU / SoC 矽晶片內部」**：
 
 ```
-[ Power On ]
-     │
-     ▼
-┌─────────────────────────┐
-│ Core Root of Trust for  │ ◀── 燒死在 SPI Flash Boot Block (不可竄改代碼)
-│ Measurement (CRTM)      │
-└────────────┬────────────┘
-             │ 1. 測量 UEFI PEI Core，寫入 Event Log 並 Extend PCR 0
-             ▼
-┌─────────────────────────┐
-│ UEFI PEI / DXE Phase    │ ◀── 系統韌體執行硬體初始化
-└────────────┬────────────┘
-             │ 2. 測量 Option ROM、Secure Boot Keys，Extend PCR 2, 7
-             ▼
-┌─────────────────────────┐
-│ UEFI Boot Manager       │ ◀── 測量開機選項路徑，Extend PCR 4
-└────────────┬────────────┘
-             │ 3. 測量 shim.efi / grubx64.efi，Extend PCR 4, 8
-             ▼
-┌─────────────────────────┐
-│ OS Bootloader (GRUB)    │
-└────────────┬────────────┘
-             │ 4. 測量 vmlinuz 核心與 initramfs，Extend PCR 9
-             ▼
-┌─────────────────────────┐
-│ OS Kernel (Linux)       │ ◀── 正式接管系統，啟動 systemd 與 IMA (PCR 10)
-└─────────────────────────┘
+[ 外部 SPI NOR Flash ] (燒錄器可實體改寫)
+  ├── UEFI BIOS / DXE 韌體磁碟區
+  └── IBB (Initial Boot Block)  <── 即使遭燒錄器惡意竄改！
+                                         │
+                                         ▼ (冷開機時由 CPU 抓入內部快取)
+[ CPU 晶圓內部 (Silicon RoT) ] ──────────┘
+  ├── Mask ROM (光罩晶圓 ROM，出廠後物理不可改)
+  ├── ACM (Authenticated Code Module 微碼)
+  └── OTP eFuses (Field Programmable Fuses)
+       └── 產線物理燒斷，寫死 OEM Root CA 公鑰 Hash
 ```
 
-#### 防範惡意 EFI 檔案的鐵律：Measure BEFORE Execute
-若攻擊者在 ESP 分割區建立一個自訂的 `.efi` 檔案：
-1. **UEFI 在執行該檔案的第一行程式碼之前**，就必須先讀取整份二進位內容，計算摘要並 **Extend PCR 4**。
-2. 即使該 `.efi` 檔案嘗試自行 Extend 其他值，**PCR 4 早已被標記改變**，數學上無法倒轉。
-3. 若開啟 Secure Boot，未經簽署的 `.efi` 直接被 UEFI 拒絕執行（Access Denied）。
+1. **晶圓級 OTP eFuse（電子保險絲）**：
+   * 在主機板出廠時（MFG 產線），工廠執行 **Fuse Burning**，將伺服器 OEM（如 Quanta, Dell, HPE）的 Root CA 公鑰 Hash **物理燒斷在 CPU 的 OTP eFuse** 內。一旦燒斷，世界上沒有任何燒錄器能重新改寫。
+2. **開機硬體驗證機制（Intel Boot Guard / AMD PSB）**：
+   * 冷開機時，CPU 第一條指令執行內建 **Mask ROM**，將 SPI Flash 開機區拉入 CPU 內部快取（NEM 模式），利用 eFuse 內的公鑰 Hash 校驗其數位簽章。
+   * **若燒錄器竄改過內容**：簽章檢驗失敗，CPU 硬體拒絕拉起 `POWER_GOOD` 或直接強制拉低 `RESET#`，主機板斷電自鎖，惡意代碼永遠無法獲得 CPU 執行權。
+3. **平台韌體彈性晶片（PFR, NIST SP 800-193）**：
+   * 現代雲端伺服器在 CPU/PCH 與 SPI Flash 之間配置專用 RoT 晶片（如 Aspeed AST1060、Lattice CPLD）。
+   * 開機前由 PFR 晶片主動驗證 SPI 簽章；若發現被燒錄器篡改，PFR 直接從被物理寫入保護的 Golden Recovery Flash 自動將官方乾淨韌體覆蓋還原。
 
-### 7.2 TCG Event Log 的關鍵角色與回放驗證 (Replay Verification)
+---
+
+### 7.2 硬體 eFuse 的驗證邊界：為什麼只驗證 IBB (Boot Block)？
+
+CPU 硬體的 eFuse / ACM **僅會驗證 SPI Flash 中的 Initial Boot Block（IBB，約 1 ~ 3 MB）**，其餘 30 ~ 60 MB 的 Flash 空間在此時完全不管。這背後有兩個無法妥協的硬體物理限制：
+
+1. **實體記憶體尚未點亮（Cache-as-RAM / NEM 限制）**：
+   * 開機第一毫秒，主機板 DDR 記憶體尚未通電穩定，記憶體控制器尚未執行記憶體訓練（MRC / DDR Training），**整張主機板上沒有任何 DRAM 可用**。
+   * CPU 僅能將內部極小的一部分 L3 Cache 配置為臨時記憶體（No-Eviction Mode, NEM）。
+   * 伺服器完整 BIOS 動輒 32 MB ~ 64 MB，快取根本裝不下，因此硬體只能載入 1 ~ 3 MB 的 IBB 進行驗證。
+2. **開機時延考量（Boot Latency）**：
+   * 透過 33MHz ~ 50MHz 的 SPI 慢速匯流排讀取 64 MB 並計算非對稱密碼學簽章，會導致冷開機延遲增加數秒。
+
+**IBB 的核心職責**：
+* 點亮實體 DDR 記憶體。
+* 內建下一階段的「檢查者（Next Checker）」程式碼與 OEM 憑證庫，作為推倒後續信任鏈骨牌的第一指。
+
+---
+
+### 7.3 骨牌效應：驗證開機 (Verified Boot) 與度量開機 (Measured Boot) 雙軌接力
+
+開機流程同時存在兩條並行的安全防線：
+* **Verified Boot（驗證開機）**：每個階段在把控制權移交給下一棒之前，**先驗證下一棒的數位簽章**，若不符則直接中斷開機（阻止惡意代碼執行）。
+* **Measured Boot（度量開機）**：每個階段在移交控制權前，**將下一棒代碼的 Hash Extend 進 TPM PCR**，記錄開機軌跡（供後續 Sealing 或 Attestation 判定）。
+
+```
+開機階段雙軌接力傳遞：
+
+[ CPU 晶圓 eFuse ]
+       │ (硬體驗證 IBB 簽章) ────────────▶ Verified Boot 防線
+       ▼
+┌──────────────────────────────┐
+│  IBB (Initial Boot Block)    │ ────▶ Extend PCR 0 (CRTM / PEI)
+└──────────────┬───────────────┘
+               │ (IBB 韌體驗證 OBB 簽章)
+               ▼
+┌──────────────────────────────┐
+│  OBB (Operating Boot Block)  │ ────▶ Extend PCR 2 (Option ROM)
+└──────────────┬───────────────┘
+               │ (DXE Secure Boot 驗證 Bootloader 簽章)
+               ▼
+┌──────────────────────────────┐
+│  UEFI Bootloader (shim/grub) │ ────▶ Extend PCR 4, 8 (Loader & Cmdline)
+└──────────────┬───────────────┘
+               │ (GRUB / shim 驗證 Linux 核心簽章)
+               ▼
+┌──────────────────────────────┐
+│  OS Kernel (vmlinuz/initrd)  │ ────▶ Extend PCR 9 (Kernel) / PCR 10 (IMA)
+└──────────────────────────────┘
+```
+
+#### 若燒錄器竄改了「Boot Block 以外」的區域（如 OBB / DXE）會如何？
+1. CPU eFuse 檢查 IBB ➡️ **PASS**（IBB 未被動過）。
+2. CPU 執行 IBB 代碼，點亮 DRAM。
+3. IBB 準備載入 OBB/DXE 時，**IBB 內建的校驗函式計算 DXE 雜湊並比對簽章**。
+4. ➡️ **校驗失敗（FAIL）！** IBB 拒絕跳轉至 DXE，觸發系統 Halting 或進入復原模式，駭客代碼依然無法執行。
+
+---
+
+### 7.4 靜態簽章的盲區：NVRAM Variable Store 與 TPM PCR 1 的防禦協同
+
+在 64 MB 的 SPI Flash 中，存在一塊**永遠無法被打上靜態數位簽章**的區域：**UEFI NVRAM Variable Store（存放 BIOS 設定、開機順序 BootOrder、系統 UUID 等）**。
+
+* **無法打靜態簽章的原因**：使用者進 BIOS Setup 修改配置、或 OS 安裝時寫入 Boot Option，該區域必須即時寫入變更。
+* **防護機制（Verified 轉向 Measured）**：
+  * 既然無法靠靜態簽章「拒絕開機」，就改由 **TPM 動態度量** 守護。
+  * UEFI 每次讀取 NVRAM 設定時，都會將設定值結構計算 Hash 並 **Extend 進 PCR 1**。
+  * 若有人用燒錄器修改了 BIOS 設定（例如關閉 VT-d），系統雖然能開機，但 PCR 1 必定偏離，TPM 晶片會拒絕解鎖硬碟金鑰（Local Unseal 失敗）。
+
+---
+
+### 7.5 惡意 EFI 檔案攔截原理：先度量、後執行 (Measure BEFORE Execute)
+
+若攻擊者在 ESP（EFI 系統分割區）內植入一個偽造或替換的 `.efi` 檔案：
+1. **度量不可逆性**：UEFI Boot Manager 在執行任何 `.efi` 代碼之前，會透過 `EFI_TCG2_PROTOCOL` 先讀取其整包二進位計算 Hash，並直接 **Extend PCR 4**。
+2. 即使該 `.efi` 檔案嘗試在執行期做任何動作，**PCR 4 早已被標記改變**，數學上無法倒回。
+3. **Secure Boot 實體攔截**：UEFI 同時會核對該 `.efi` 的數位簽章是否在 `db` 白名單內且不在 `dbx` 撤銷黑名單內；若未經認證，直接拋出 `Access Denied` 終止執行。
+
+---
+
+### 7.6 TCG Event Log 的關鍵角色與回放驗證 (Replay Verification)
 * **問題**：PCR 暫存器只裝得下最終的 32-byte 雜湊值。若 PCR 算出的值與預期不符，無法由 PCR 倒推何處出錯。
 * **解法**：UEFI 在主機記憶體維護一份結構化的二進位歷史記錄——**TCG Event Log**（Linux 下位於 `/sys/kernel/security/tpm0/binary_bios_measurements`）。
 * **回放驗證**：驗證者將 Event Log 條目在本地逐筆執行數學 Extend 模擬重算，若計算結果與晶片物理 PCR 一模一樣，即證明該 Event Log 真實可信，可逐項審計每個開機模組。
