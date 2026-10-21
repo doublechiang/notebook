@@ -22,6 +22,23 @@
   * EID 空間耗盡的四大產業界實務解法 (Isolated Domains, Dynamic Reset, Bridge, 16-bit EID)
   * 附錄：PCIe Enumeration 枚舉階段資源分配深度剖析 (BDF、BAR 探測原理與 VDM 路由依賴)
 
+### 儲存裝置外形 (Storage Form Factors)
+* [**伺服器儲存裝置外形對照筆記 (EDSFF / U.2 / U.3 / M.2)**](storage-form-factor-notes.md)
+  * EDSFF 家族與規格書：E1.S (SFF-TA-1006)、E1.L (SFF-TA-1007)、E2 (SFF-TA-1042)、E3 (SFF-TA-1008)，共用 SFF-TA-1002 / 1009
+  * 尺寸、厚度、功耗對照表，逐項標示已核 / 未核
+  * E1.S 厚度與功耗等級 (5.9 ~ 25 mm)、E2 vs. E3.L 體積比較（長不等於大）
+  * 時間順序 (E1 / E3 → E2)、與 U.2 / U.3 / M.2 的取代關係
+  * 製造測試影響：sideband / LED 測項重寫、E3.S 槽可能是 CXL 記憶體
+
+### 散熱與液冷 (Thermal & Liquid Cooling)
+* [**伺服器液冷架構筆記 (Cold Plate / UQD / CDU / Leak Detection)**](liquid-cooling-notes.md)
+  * 整體架構：FWS（機房水）/ CDU / TCS（IT 側 PG25）兩迴路隔離
+  * 伺服器端元件：cold plate、管路、漏液與流量感測
+  * OCP UQD / UQDB 快速接頭：尺寸 02 / 04 / 06 / 08、v2.0.0 合併兩份規格、廠商數字差異
+  * CDU 型態：In-rack vs. In-row 容量量級
+  * Redfish LeakDetection / LeakDetector schema、路徑演進與廠商舊版差異
+  * 製造測試影響：漏液工站、燒機溫度異常的擴大懷疑範圍、治具 UQD 壽命管理
+
 ### 平台安全與信任根技術 (Platform Security & Root of Trust)
 * [**TPM 2.0 架構與可信賴計算技術筆記**](tpm-architecture-notes.md)
   * TCG TPM 2.0 規範與密碼學敏捷性 (Crypto Agile vs. TPM 1.2)
