@@ -46,6 +46,16 @@
   * 信號競爭 (Race Condition) 陷阱：`select` 盲區與 `pselect` 原子性信號遮罩 (Atomic Sigmask) 原理
   * 核心機制對比總結表 (C-state vs. P-state、select vs. poll vs. epoll)
 
+### 網路與資料傳輸 (Networking & Data Transport)
+* [**RDMA 三項核心特性筆記**](rdma-core-properties-notes.md)
+  * RDMA 的定義 (Remote Direct Memory Access，對端 CPU 不介入)
+  * Zero-copy 與 Memory Registration (lkey / rkey、GPUDirect RDMA)
+  * Kernel Bypass：控制路徑 vs. 資料路徑 (kernel 內 RDMA 反例：NVMe-oF、iSER、SMB Direct)
+  * Hardware Transport：InfiniBand / RoCE v2 / iWARP，及軟體實作 Soft-RoCE (rxe)、siw
+  * 總整理：三項特性與定義的關係
+  * GPUDirect RDMA 控制流程 (CPU 發起 vs. GPU-initiated IBGDA) 與 PCIe 拓撲 / ACS 測試陷阱
+  * RDMA 網卡 vs. DPU：卸載傳輸 vs. 卸載基礎設施，BF-4 使用場景與測試差異
+
 ---
 
 ## 閱讀建議 (Viewing in VS Code)
